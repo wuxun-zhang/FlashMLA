@@ -1,3 +1,6 @@
 [submodule "csrc/cutlass"]
 	path = csrc/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "csrc/sycl-tla"]
+	path = csrc/sycl-tla
+	url = https://github.com/intel/sycl-tla

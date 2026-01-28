@@ -3,7 +3,15 @@ import dataclasses
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+try:
+    import flash_mla.cuda as flash_mla_cuda
+except ImportError:
+    flash_mla_cuda = None
+
+try:
+    import flash_mla.xpu as flash_mla_xpu
+except ImportError:
+    flash_mla_xpu = None
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -205,9 +213,14 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
     """
-    results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
-    )
+    if flash_mla_xpu is not None:
+        results = flash_mla_xpu.sparse_prefill_fwd(
+            q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        )
+    else:
+        results = flash_mla_cuda.sparse_prefill_fwd(
+            q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        )
     return results
 
 

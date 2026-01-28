@@ -9,7 +9,9 @@ from torch.utils.cpp_extension import (
     BuildExtension,
     CUDAExtension,
     IS_WINDOWS,
-    CUDA_HOME
+    CUDA_HOME,
+    SYCL_HOME,
+    SyclExtension,
 )
 
 
@@ -23,6 +25,12 @@ def get_features_args():
     return features_args
 
 def get_arch_flags():
+    if SYCL_HOME is not None:
+        assert CUDA_HOME is None, "Only one of CUDA or SYCL can be used at a time"
+        # override arch lists
+        os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg"
+        return []
+
     # Check NVCC Version
     # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable. For more details, see `torch/utils/cpp_extension.py`
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
@@ -50,6 +58,7 @@ def get_nvcc_thread_args():
     return ["--threads", nvcc_threads]
 
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "csrc/sycl-tla"])
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -59,8 +68,9 @@ else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
 ext_modules = []
-ext_modules.append(
-    CUDAExtension(
+
+def get_cuda_extension():
+    return CUDAExtension(
         name="flash_mla.cuda",
         sources=[
             # API
@@ -131,7 +141,39 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
         ],
     )
-)
+
+def get_xpu_extension():
+    sycl_tla_flags = ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
+    return SyclExtension(
+        name="flash_mla.xpu",
+        sources=[
+            # dummy file to trigger SYCL build
+            "csrc/xpu.sycl",
+            # API
+            "csrc/api/api.cpp",
+        ],
+        extra_compile_args={
+            "cxx": cxx_args + ["-DUSE_XPU"] + sycl_tla_flags + get_features_args(),
+            "sycl": [
+                "-O3",
+                "-std=c++20",
+                "-DNDEBUG",
+            ] + get_features_args() + get_arch_flags(),
+        },
+        include_dirs=[
+            Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
+            Path(this_dir) / "csrc" / "sycl-tla" / "include",
+            Path(this_dir) / "csrc" / "sycl-tla" / "tools" / "util" / "include",
+        ],
+    )
+
+def get_ext_modules():
+    ext_modules = []
+    if CUDA_HOME is not None:
+        ext_modules.append(get_cuda_extension())
+    else:
+        ext_modules.append(get_xpu_extension())
+    return ext_modules
 
 try:
     cmd = ['git', 'rev-parse', '--short', 'HEAD']
@@ -146,6 +188,6 @@ setup(
     name="flash_mla",
     version="1.0.0" + rev,
     packages=find_packages(include=['flash_mla']),
-    ext_modules=ext_modules,
+    ext_modules=get_ext_modules(),
     cmdclass={"build_ext": BuildExtension},
 )
