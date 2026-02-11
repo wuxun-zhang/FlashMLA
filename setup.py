@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
 from datetime import datetime
+import shutil
 import subprocess
+import glob
 
 from setuptools import setup, find_packages
 
+import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
     CUDAExtension,
@@ -12,6 +15,7 @@ from torch.utils.cpp_extension import (
     CUDA_HOME,
     SYCL_HOME,
     SyclExtension,
+    _SYCL_DLINK_FLAGS,
 )
 
 
@@ -28,7 +32,7 @@ def get_arch_flags():
     if SYCL_HOME is not None:
         assert CUDA_HOME is None, "Only one of CUDA or SYCL can be used at a time"
         # override arch lists
-        os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg"
+        os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg-g21-a0"
         return []
 
     # Check NVCC Version
@@ -142,23 +146,43 @@ def get_cuda_extension():
         ],
     )
 
+USE_XPU = SYCL_HOME is not None and torch.version.xpu is not None
+if USE_XPU:
+    # WA: append extra link flags for sycl-tla
+    extra_flags = ["-fsycl-targets=spir64_gen",
+                    "-Xspirv-translator",
+                    "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"]
+    _SYCL_DLINK_FLAGS += extra_flags
+
+def rename_cpp_to_sycl(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + ".sycl")
+
+def remove_sycl_files(sycl_files):
+    for entry in sycl_files:
+        os.remove(entry)
+
 def get_xpu_extension():
     sycl_tla_flags = ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
+
+    sycl_sources = ["csrc/api/sparse_fwd_xpu.cpp"]
+    rename_cpp_to_sycl(sycl_sources)
+    renamed_sycl_files = [os.path.splitext(entry)[0] + ".sycl" for entry in sycl_sources]
+
     return SyclExtension(
         name="flash_mla.xpu",
         sources=[
-            # dummy file to trigger SYCL build
-            "csrc/xpu.sycl",
             # API
             "csrc/api/api.cpp",
+            # source
+            *renamed_sycl_files,
         ],
         extra_compile_args={
             "cxx": cxx_args + ["-DUSE_XPU"] + sycl_tla_flags + get_features_args(),
             "sycl": [
                 "-O3",
-                "-std=c++20",
                 "-DNDEBUG",
-            ] + get_features_args() + get_arch_flags(),
+            ] + get_features_args() + get_arch_flags() + sycl_tla_flags + extra_flags,
         },
         include_dirs=[
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
@@ -166,6 +190,18 @@ def get_xpu_extension():
             Path(this_dir) / "csrc" / "sycl-tla" / "tools" / "util" / "include",
         ],
     )
+
+class CustomBuildExtension(BuildExtension):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def run(self):
+        super().run()
+
+        # cleanup renamed .sycl files
+        if USE_XPU:
+            sycl_files = glob.glob("csrc/api/*.sycl")
+            remove_sycl_files(sycl_files)
 
 def get_ext_modules():
     ext_modules = []
@@ -189,5 +225,5 @@ setup(
     version="1.0.0" + rev,
     packages=find_packages(include=['flash_mla']),
     ext_modules=get_ext_modules(),
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": CustomBuildExtension},
 )
