@@ -7,6 +7,8 @@ enum class ModelType {
     MODEL1
 };
 
+#if !defined(USE_XPU)
+
 struct __align__(4*8) DecodingSchedMeta {
     int begin_req_idx, end_req_idx;     // Both inclusive
     int begin_block_idx, end_block_idx; // Inclusive, exclusive
@@ -142,6 +144,8 @@ struct GetDecodeSchedMetaParams {
     cudaStream_t stream;
 };
 
+#endif
+
 struct SparseAttnFwdParams {
     int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
     float sm_scale, sm_scale_div_log2;
@@ -164,7 +168,11 @@ struct SparseAttnFwdParams {
     float* __restrict__ lse; // [s_q, h_q]
 
     int num_sm;
+#if defined(USE_XPU)
+    sycl::queue queue;
+#else
     cudaStream_t stream;
+#endif
 };
 
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
@@ -176,5 +184,9 @@ enum class SparseAttnFwdMode {
 template<SparseAttnFwdMode FWD_MODE>
 inline constexpr bool is_decode_v = std::bool_constant<FWD_MODE == SparseAttnFwdMode::DecodeWithSplitKV>::value;
 
+#if !defined(USE_XPU)
 template<SparseAttnFwdMode FWD_MODE>
 using SparseFwdArgT = std::conditional_t<is_decode_v<FWD_MODE>, SparseAttnDecodeParams, SparseAttnFwdParams>;
+#else
+using SparseFwdArgT = SparseAttnFwdParams;
+#endif

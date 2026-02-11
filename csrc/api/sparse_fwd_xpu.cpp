@@ -6,6 +6,50 @@
 
 #include <cutlass/bfloat16.h>
 
+#include "common.h"
+#include "params.h"
+
+#include "xe2/prefill/sparse/fwd.hpp"
+
+enum class FwdFeatures : int {
+    HEAD_64,
+    HEAD_128,
+
+    HEAD_DIM_576,
+    HEAD_DIM_512,
+
+    ATTN_SINK,
+    SINK_LSE,
+    TOPK_LENGTH
+};
+
+class FwdImplBase : public ImplBase<
+    SparseAttnFwdParams,
+    FwdFeatures
+> {};
+
+class Fwd_Xe2_Impl : public FwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        // FwdFeatures::HEAD_64, // num_heads_q = 64
+        FwdFeatures::HEAD_128, // num_heads_q = 128
+        // FwdFeatures::HEAD_DIM_512, // head_dim_qk = 512
+        FwdFeatures::HEAD_DIM_576, // head_dim_qk = 576
+        FwdFeatures::ATTN_SINK,
+        // FwdFeatures::SINK_LSE,
+        FwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+            DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
+                xe2::fwd::run_fwd_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+            });
+        });
+    }
+};
+
+
 std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
@@ -16,8 +60,8 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     const std::optional<at::Tensor> &topk_length
 ) {
     using bf16 = cutlass::bfloat16_t;
-    
-    // Arch arch = Arch();
+
+    Arch arch = Arch();
     // bool is_sm90a = arch.is_sm90a();
     // bool is_sm100f = arch.is_sm100f();
     // TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
@@ -39,12 +83,12 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
     
-    // KU_CHECK_DEVICE(q);
-    // KU_CHECK_DEVICE(kv);
-    // KU_CHECK_DEVICE(indices);
-    // KU_CHECK_DEVICE(attn_sink);
-    // KU_CHECK_DEVICE(topk_length);
-    
+    KU_CHECK_DEVICE_XPU(q);
+    KU_CHECK_DEVICE_XPU(kv);
+    KU_CHECK_DEVICE_XPU(indices);
+    KU_CHECK_DEVICE_XPU(attn_sink);
+    KU_CHECK_DEVICE_XPU(topk_length);
+
     KU_CHECK_DTYPE(q, torch::kBFloat16);
     KU_CHECK_DTYPE(kv, torch::kBFloat16);
     KU_CHECK_DTYPE(indices, torch::kInt32);
@@ -74,27 +118,29 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
 
-    // SparseAttnFwdParams params = {
-    //     s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
-    //     sm_scale, sm_scale * LOG_2_E,
+    SparseAttnFwdParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        sm_scale, sm_scale * LOG_2_E,
 
-    //     (bf16*)q.data_ptr(),
-    //     (bf16*)kv.data_ptr(),
-    //     (int*)indices.data_ptr(),
-    //     ku::get_optional_tensor_ptr<float>(attn_sink),
-    //     ku::get_optional_tensor_ptr<int>(topk_length),
+        (bf16*)q.data_ptr(),
+        (bf16*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        ku::get_optional_tensor_ptr<float>(attn_sink),
+        ku::get_optional_tensor_ptr<int>(topk_length),
 
-    //     int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
-    //     int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
-    //     int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
 
-    //     (bf16*)out.data_ptr(),
-    //     (float*)max_logits.data_ptr(),
-    //     (float*)lse.data_ptr(),
+        (bf16*)out.data_ptr(),
+        (float*)max_logits.data_ptr(),
+        (float*)lse.data_ptr(),
 
-    //     arch.num_sms,
-    //     at::xpu::getCurrentXPUStream().stream()
-    // };
+        arch.num_sms,
+        at::xpu::getCurrentXPUStream().queue()
+    };
+
+    printf("num SMs: %d\n", params.num_sm);
 
     // std::vector<FwdFeatures> required_features;
     // if (h_q == 64) {

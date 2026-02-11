@@ -3,8 +3,12 @@
 #include <span>
 
 #include <torch/extension.h>
+#if !defined(USE_XPU)
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#else
+#include <ATen/xpu/XPUContext.h>
+#endif
 #include <kerutils/supplemental/torch_tensors.h>
 
 #include <cutlass/bfloat16.h>
@@ -22,6 +26,7 @@ struct Arch {
     int major;
     int minor;
     int num_sms;
+#if !defined(USE_XPU)
     cudaDeviceProp* device_prop;
 
     Arch() {
@@ -38,6 +43,13 @@ struct Arch {
     bool is_sm100f() const {
         return major == 10;
     }
+#else
+    c10::xpu::DeviceProp* device_prop;
+    Arch() {
+        device_prop = at::xpu::getCurrentDeviceProperties();
+        num_sms = device_prop->gpu_eu_count / device_prop->gpu_eu_count_per_subslice;
+    }
+#endif
 };
 
 // Convert int64_t stride to int32_t, with overflow check.

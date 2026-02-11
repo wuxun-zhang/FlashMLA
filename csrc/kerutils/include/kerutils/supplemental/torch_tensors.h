@@ -55,6 +55,8 @@ static inline PtrT* get_optional_tensor_ptr(const T& tensor_or_opt) {
 // Check whether the given tensor (or optional<tensor>) is on cuda
 #define KU_CHECK_DEVICE(tensor) TORCH_CHECK(ku::_check_optional_tensor(tensor, [](const at::Tensor& t) { return t.is_cuda(); }), #tensor " must be on CUDA")
 
+#define KU_CHECK_DEVICE_XPU(tensor) TORCH_CHECK(ku::_check_optional_tensor(tensor, [](const at::Tensor& t) { return t.is_xpu(); }), #tensor " must be on XPU")
+
 // Check whether the given tensor (or optional<tensor>) has the given number of dimensions
 #define KU_CHECK_NDIM(tensor, ndim) TORCH_CHECK(ku::_check_optional_tensor(tensor, [&](const at::Tensor& t) { return t.dim() == (ndim); }), #tensor " must have " #ndim " dimensions")
 

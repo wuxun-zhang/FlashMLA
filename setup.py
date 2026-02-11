@@ -31,8 +31,6 @@ def get_features_args():
 def get_arch_flags():
     if SYCL_HOME is not None:
         assert CUDA_HOME is None, "Only one of CUDA or SYCL can be used at a time"
-        # override arch lists
-        os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg-g21-a0"
         return []
 
     # Check NVCC Version
@@ -154,6 +152,13 @@ if USE_XPU:
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"]
     _SYCL_DLINK_FLAGS += extra_flags
 
+    # override arch lists
+    os.environ["TORCH_XPU_ARCH_LIST"] = "pvc,bmg-g21-a0"
+    # WA: add internal options
+    os.environ["IGC_VISAOptions"] = "-perfmodel"
+    os.environ["IGC_ExtraOCLOptions"] = "-cl-intel-256-GRF-per-thread"
+    os.environ["SYCL_PROGRAM_COMPILE_OPTIONS"] = "-ze-opt-large-register-file -gline-tables-only"
+
 def rename_cpp_to_sycl(cpp_files):
     for entry in cpp_files:
         shutil.copy(entry, os.path.splitext(entry)[0] + ".sycl")
@@ -165,7 +170,8 @@ def remove_sycl_files(sycl_files):
 def get_xpu_extension():
     sycl_tla_flags = ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
 
-    sycl_sources = ["csrc/api/sparse_fwd_xpu.cpp"]
+    sycl_sources = ["csrc/api/sparse_fwd_xpu.cpp",
+                    "csrc/xe2/prefill/sparse/fwd.cpp"]
     rename_cpp_to_sycl(sycl_sources)
     renamed_sycl_files = [os.path.splitext(entry)[0] + ".sycl" for entry in sycl_sources]
 
@@ -182,9 +188,12 @@ def get_xpu_extension():
             "sycl": [
                 "-O3",
                 "-DNDEBUG",
+                "-std=c++20",
+                "-DUSE_XPU",
             ] + get_features_args() + get_arch_flags() + sycl_tla_flags + extra_flags,
         },
         include_dirs=[
+            Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
             Path(this_dir) / "csrc" / "sycl-tla" / "include",
             Path(this_dir) / "csrc" / "sycl-tla" / "tools" / "util" / "include",
@@ -201,6 +210,7 @@ class CustomBuildExtension(BuildExtension):
         # cleanup renamed .sycl files
         if USE_XPU:
             sycl_files = glob.glob("csrc/api/*.sycl")
+            sycl_files += glob.glob("csrc/xe2/**/*.sycl", recursive=True)
             remove_sycl_files(sycl_files)
 
 def get_ext_modules():
