@@ -9,7 +9,7 @@
 #include "common.h"
 #include "params.h"
 
-#include "xe2/prefill/sparse/fwd.hpp"
+#include "xe2/prefill/sparse/kernel.hpp"
 
 enum class FwdFeatures : int {
     HEAD_64,
@@ -43,7 +43,7 @@ protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                xe2::fwd::run_fwd_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+                xe2::fwd::run_fwd_kernel_impl<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
             });
         });
     }
@@ -62,9 +62,6 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     using bf16 = cutlass::bfloat16_t;
 
     Arch arch = Arch();
-    // bool is_sm90a = arch.is_sm90a();
-    // bool is_sm100f = arch.is_sm100f();
-    // TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -142,56 +139,30 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
 
     printf("num SMs: %d\n", params.num_sm);
 
-    // std::vector<FwdFeatures> required_features;
-    // if (h_q == 64) {
-    //     required_features.push_back(FwdFeatures::HEAD_64);
-    // } else if (h_q == 128) {
-    //     required_features.push_back(FwdFeatures::HEAD_128);
-    // } else {
-    //     TORCH_CHECK(false, "Unsupported h_q: ", h_q);
-    // }
-    // if (d_qk == 576) {
-    //     required_features.push_back(FwdFeatures::HEAD_DIM_576);
-    // } else if (d_qk == 512) {
-    //     required_features.push_back(FwdFeatures::HEAD_DIM_512);
-    // } else {
-    //     TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
-    // }
-    // if (attn_sink.has_value()) {
-    //     required_features.push_back(FwdFeatures::ATTN_SINK);
-    // }
-    // if (have_topk_length) {
-    //     required_features.push_back(FwdFeatures::TOPK_LENGTH);
-    // }
+    std::vector<FwdFeatures> required_features;
+    if (h_q == 64) {
+        required_features.push_back(FwdFeatures::HEAD_64);
+    } else if (h_q == 128) {
+        required_features.push_back(FwdFeatures::HEAD_128);
+    } else {
+        TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+    }
+    if (d_qk == 576) {
+        required_features.push_back(FwdFeatures::HEAD_DIM_576);
+    } else if (d_qk == 512) {
+        required_features.push_back(FwdFeatures::HEAD_DIM_512);
+    } else {
+        TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+    }
+    if (attn_sink.has_value()) {
+        required_features.push_back(FwdFeatures::ATTN_SINK);
+    }
+    if (have_topk_length) {
+        required_features.push_back(FwdFeatures::TOPK_LENGTH);
+    }
 
-    // if (is_sm90a) {
-    //     Fwd_Sm90_Impl fwd_impl;
-    //     fwd_impl.run(params, required_features);
-    // } else if (is_sm100f) {
-    //     if (h_q == 64) {
-    //         Fwd_Sm100_Head64_Impl fwd_impl;
-    //         fwd_impl.run(params, required_features);
-    //     } else if (h_q == 128) {
-    //         Fwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-    //         Fwd_Sm100_Head128_Impl regular_impl;
-    //         bool use_small_topk_impl = false;
-    //         if (
-    //             (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-    //             !regular_impl.check_if_all_features_are_supported(required_features)
-    //         ) {
-    //             use_small_topk_impl = true;
-    //         }
-    //         if (use_small_topk_impl) {
-    //             small_topk_impl.run(params, required_features);
-    //         } else {
-    //             regular_impl.run(params, required_features);
-    //         }
-    //     } else {
-    //         TORCH_CHECK(false, "Unsupported h_q: ", h_q);
-    //     }
-    // } else {
-    //     TORCH_CHECK(false, "Unsupported architecture");
-    // }
+    Fwd_Xe2_Impl fwd_impl;
+    fwd_impl.run(params, required_features);
 
     return {out, max_logits, lse};
 }

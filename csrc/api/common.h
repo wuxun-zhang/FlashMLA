@@ -229,7 +229,11 @@ public:
             }
             fprintf(stderr, "\n");
             Arch cur_gpu_arch = Arch();
+#if !defined(USE_XPU)
             fprintf(stderr, "Current GPU: %s, SM %d.%d with %d SMs\n", cur_gpu_arch.device_prop->name, cur_gpu_arch.major, cur_gpu_arch.minor, cur_gpu_arch.num_sms);
+#else
+            fprintf(stderr, "Current GPU: %s with %d SMs\n", cur_gpu_arch.device_prop->name.c_str(), cur_gpu_arch.num_sms);
+#endif
             fprintf(stderr, "This means that the dispatcher has chosen an implementation that does not support all required features. Maybe there is a bug in the dispatcher, or you have requested an invalid combination of features.\n");
             TORCH_CHECK(false, "The chosen implementation does not support all required features. See message above for details.");
         }
