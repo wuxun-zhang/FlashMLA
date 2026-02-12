@@ -42,7 +42,8 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 template<typename TMAParams>
 __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+// #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+#if 1
     const int q_h_idx = blockIdx.x % (params.h_q/B_H);
     const int s_q_idx = blockIdx.x / (params.h_q/B_H);
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();

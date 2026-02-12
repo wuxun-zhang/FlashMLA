@@ -12,8 +12,8 @@
 #include "xe2/prefill/sparse/kernel.hpp"
 
 enum class FwdFeatures : int {
-    HEAD_64,
-    HEAD_128,
+    HEAD_64, // GLM-5
+    HEAD_128, // deepseek v3.2
 
     HEAD_DIM_576,
     HEAD_DIM_512,
