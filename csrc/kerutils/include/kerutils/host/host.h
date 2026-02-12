@@ -9,7 +9,6 @@
 #include <cuda.h>
 
 #include <cutlass/cuda_host_adapter.hpp>
-
 #include "kerutils/common/common.h"
 
 namespace kerutils {

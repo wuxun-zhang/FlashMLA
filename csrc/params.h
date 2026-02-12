@@ -168,9 +168,7 @@ struct SparseAttnFwdParams {
     float* __restrict__ lse; // [s_q, h_q]
 
     int num_sm;
-#if defined(USE_XPU)
-    sycl::queue queue;
-#else
+#if !defined(USE_XPU)
     cudaStream_t stream;
 #endif
 };

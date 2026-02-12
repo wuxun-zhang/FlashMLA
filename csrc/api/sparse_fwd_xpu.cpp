@@ -24,7 +24,7 @@ enum class FwdFeatures : int {
 };
 
 class FwdImplBase : public ImplBase<
-    SparseAttnFwdParams,
+    XPUSparseAttnFwdParams,
     FwdFeatures
 > {};
 
@@ -40,7 +40,7 @@ class Fwd_Xe2_Impl : public FwdImplBase {
     )
 
 protected:
-    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+    void run_(const XPUSparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
                 xe2::fwd::run_fwd_kernel_impl<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
@@ -48,7 +48,6 @@ protected:
         });
     }
 };
-
 
 std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
@@ -115,7 +114,7 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
 
-    SparseAttnFwdParams params = {
+    XPUSparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * LOG_2_E,
 

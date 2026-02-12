@@ -171,7 +171,8 @@ def get_xpu_extension():
     sycl_tla_flags = ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
 
     sycl_sources = ["csrc/api/sparse_fwd_xpu.cpp",
-                    "csrc/xe2/prefill/sparse/fwd.cpp"]
+                    "csrc/xe2/prefill/sparse/instantiations/k576.cpp",
+                    "csrc/xe2/prefill/sparse/instantiations/k576_topklen.cpp"]
     rename_cpp_to_sycl(sycl_sources)
     renamed_sycl_files = [os.path.splitext(entry)[0] + ".sycl" for entry in sycl_sources]
 
