@@ -114,7 +114,7 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
 
-    XPUSparseAttnFwdParams params = {
+    XPUSparseAttnFwdParams params {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * LOG_2_E,
 

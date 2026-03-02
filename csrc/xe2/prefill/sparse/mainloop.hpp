@@ -232,8 +232,8 @@ struct Xe2FwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     Tensor cQ = make_identity_tensor(Q_2D.shape());             // (q,d)
     Tensor cK = make_identity_tensor(K_2D.shape());             // (k,d)
     Tensor cV = make_identity_tensor(V_2D.shape());             // (v,k)
-    Tensor cK_cache = make_identity_tensor(K_cache_2D.shape()); // (k,d)
-    Tensor cV_cache = make_identity_tensor(V_cache_2D.shape()); // (v,k)
+    // Tensor cK_cache = make_identity_tensor(K_cache_2D.shape()); // (k,d)
+    // Tensor cV_cache = make_identity_tensor(V_cache_2D.shape()); // (v,k)
     Tensor cP = make_identity_tensor(take<0,2>(TileShapeQK{})); // (q,k)
 
     /* Partition global tensors into workgroup tiles */
