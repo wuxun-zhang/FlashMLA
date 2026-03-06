@@ -16,7 +16,7 @@ def test_sparse_prefill_fwd():
     h_kv = 1
     d_qk = 576
     d_v = 512
-    topk = 64
+    topk = 128
 
     q = torch.randn((s_q, h_q, d_qk), device=device, dtype=dtype)
     kv = torch.randn((s_kv, h_kv, d_qk), device=device, dtype=dtype)
