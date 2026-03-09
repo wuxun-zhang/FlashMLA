@@ -14,10 +14,6 @@
 #include <cute/util/compat/dims.hpp>
 #include <cute/util/compat/launch_policy.hpp>
 
-// #include "mainloop.hpp"
-// #include "epilogue.hpp"
-// #include "tile_scheduler.hpp"
-
 // WA: avoid issue of not supported device-only copy
 struct XPUSparseAttnFwdParams : public SparseAttnFwdParams {
     sycl::queue queue;
@@ -72,21 +68,72 @@ struct KernelConfig {
 
     constexpr static int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
     // bf16 dpas m8n16k16
-    // (8, 256, 32) / ((8, 16, 16) * (1, 16, 1)) = (1, 1, 2) iterations per subgroup
+    // (8, 128, 64) / ((8, 16, 16) * (1, 16, 1)) = (1, 1, 4) iterations per subgroup
     using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, bfloat16_t>;
     using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
     using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
-
 };
 
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 class KernelTemplate_1 {
 public:
-    struct SharedStorage {
+    using ElementQ = KernelConfig::ElementQ;
+    using ElementKV = KernelConfig::ElementKV;
+    using ElementO = KernelConfig::ElementO;
+    using ElementS = typename KernelConfig::TiledMMAQK::ValTypeD;
+    using ElementA = typename KernelConfig::TiledMMAPV::ValTypeD;
+
+    // Split k-reduced tiles between participating subgroups.
+    using ReduceK = decltype(size<3>(typename KernelConfig::TiledMMAPV::ThrLayoutVMNK{}));
+
+     // (8,1,4)
+    using SingleFragA = decltype(KernelConfig::TiledMMAPV{}.get_slice(0).partition_sg_fragment_C(make_identity_tensor(select<0,1>(KernelConfig::TileShapePV{}))));
+    // （8,1,4,8)
+    using FragA = expand_sg_fragment_t<SingleFragA, 1, KernelConfig::D_V / get<1>(KernelConfig::TileShapePV{})>;     // (atom val,q',v',VV)
+    // storing updated global row-max and row-sum
+    // (1) - thr_id 0 ~ B_H-1 holds max of each row
+    using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
+    // static_assert(is_same_v<decltype(FragA{}.shape()), float>, "dtype mismatch");
+
+    static auto reduce_sg_v_helper() {
+        constexpr auto v_total_sg = get<1>(SGTileShapeA{}) / intel::_SGSize{};
+        constexpr auto v_avail_sg = ReduceK{} / ReduceSGQ{};
+        return Int<(v_total_sg > v_avail_sg) ? cute::gcd(v_total_sg, v_avail_sg) : v_total_sg>{};
+    }
+
+    using SGTileShapeA = decltype(atuple_coshape(FragA{}.tv_layout()));
+    using ReduceSGQ = decltype(cute::gcd(get<0>(SGTileShapeA{}), ReduceK{}));
+    using ReduceSGV = decltype(reduce_sg_v_helper());
+    using ReduceSGLayout = decltype(make_identity_layout(Shape<ReduceSGQ, ReduceSGV>{}));
+
+    using SGTileShapeO = decltype(shape_div(take<0,2>(SGTileShapeA{}), shape(ReduceSGLayout{})));
+
+    using ReduceFragA = decltype(make_subgroup_tensor<ElementA>(
+        make_layout(select<1,0>(SGTileShapeO{}),
+                    Stride<E<1>, E<0>>{})
+    ));
+    using ReduceFragARow = decltype(reduce<1>(ReduceFragA{}, sycl::plus<void>{}));
+
+    using SGPerWG = decltype(product(take<1,4>(shape(typename KernelConfig::TiledMMAPV::ThrLayoutVMNK{}))));
+
+    struct SharedStorageNonReduceK {
         cute::array_aligned<cutlass::bfloat16_t, D_QK * KernelConfig::B_TOPK> k[KernelConfig::stages];
         bool is_kv_valid[KernelConfig::B_TOPK];
     };
 
+    // Shared memory storage
+    // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe block load infrastructure.
+    using AlignedSGTileA_Q = C<((size<0>(SGTileShapeA{}) + intel::sg_size - 1) / intel::sg_size) * intel::sg_size>;
+
+    struct SharedStorageReduceK {
+        cute::array_aligned<cutlass::bfloat16_t, D_QK * KernelConfig::B_TOPK> k[KernelConfig::stages];
+        bool is_kv_valid[KernelConfig::B_TOPK];
+
+        cute::array<ElementA, size(SGTileShapeA{}) * SGPerWG{}> a_data;
+        cute::array<ElementA,   AlignedSGTileA_Q{} * SGPerWG{}> a_sum_data, a_max_data;
+    };
+
+    using SharedStorage = conditional_t<(ReduceK{} > 1), SharedStorageReduceK, SharedStorageNonReduceK>;
     static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0)
                                                                         : sizeof(SharedStorage);
     using Params = SparseAttnFwdParams;
@@ -99,11 +146,6 @@ public:
         static_assert(KernelConfig::D_V / KernelConfig::HEAD_DIM_TILE_SIZE == 8, "Head dim must be divisible by tile size");
 
         SharedStorage &shared_storage = *reinterpret_cast<SharedStorage *>(smem_buf);
-
-        using ElementQ = KernelConfig::ElementQ;
-        using ElementKV = KernelConfig::ElementKV;
-        using ElementO = KernelConfig::ElementO;
-        using ElementS = typename KernelConfig::TiledMMAQK::ValTypeD;
 
         const ElementQ* q = params.q;
         const ElementKV* kv = params.kv;
@@ -155,12 +197,22 @@ public:
         Tensor sK = local_tile(proxyK, shape(KernelConfig::SmemTileLayoutK{}), make_coord(0,_)); // (k,d,D)
         // (64,128,9)
         Tensor sV = local_tile(proxyV, shape(KernelConfig::SmemTileLayoutV{}), make_coord(_,0)); // (d,k,D)
-        Tensor gO = local_tile(proxyO, shape(KernelConfig::TileShapeOut{}), make_coord(cur_head_start_idx,_));
+        Tensor gO = local_tile(proxyO, KernelConfig::TileShapeOut{}, make_coord(cur_head_start_idx,_));
 
         // static_assert(is_same_v<decltype(sV.shape()), float>, "dtype mismatch");
 
         KernelConfig::TiledMMAQK mma_qk{};
         KernelConfig::TiledMMAPV mma_pv{};
+
+        // (V,M,N,K)
+        //  V -> num threads per MMA atom
+        //  M -> repetition of M dimension in MMA operation
+        //  N -> repetition of N dimension in MMA operation
+        //  K -> repetition of reduction dimension in MMA operation
+        // V*M*N*K == total threads participating in the MMA operation
+        //
+        // (16,1,1,16)
+        static_assert(is_same_v<decltype(typename KernelConfig::TiledMMAQK::ThrLayoutVMNK{}), float>, "dtype mismatch");
 
         // // Shared memory buffers
         // Layout K_slm_layout = make_layout(append<3>(typename decltype(r2s_K)::Tiler_MN{}, Int<Stages>{}));
@@ -168,24 +220,31 @@ public:
         auto K_slm = make_tensor(make_smem_ptr(shared_storage.k[0].data()), SmemLayoutK{});
         auto V_slm = make_tensor(make_smem_ptr(shared_storage.k[0].data()), SmemLayoutVTransposed{});
 
-        // create tiled copy for loading Q from gmem
+        // create tiled copy for loading from gmem or storing to gmem
         auto tiled_copy_Q = make_block_2d_copy_A(mma_qk, Q);
+        // auto tiled_copy_O = make_block_2d_copy_D(mma_pv, O);
+        auto tiled_copy_O = (ReduceK{} > _1{}) ? make_block_2d_copy_D_subtiled(mma_pv, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, proxyO)
+                                            : make_block_2d_copy_A(mma_pv, O);
         // get copy slice for each work item
         auto thr_copy_q = tiled_copy_Q.get_slice(thr_id);
+        auto thr_copy_o = tiled_copy_O.get_slice(thr_id);
 
         // dummy one to help create proper SLM copy
         auto tiled_copy_k = make_block_2d_copy_B(mma_qk, make_tensor(make_gmem_ptr(static_cast<ElementKV*>(nullptr)), SmemLayoutK{}));
         // create s2r copy for load K from SLM to register
-        // FIXME: how to choose copy atom???
-        using Copy_Atom_s2r_k = Copy_Atom<UniversalCopy<cutlass::AlignedArray<ElementKV, 16, 32>>, cutlass::AlignedArray<ElementKV, 16, 32>>;
+        // FIXME: how to choose copy atom??? try with XE_1D_LDSM
+        // using Copy_Atom_s2r_k = Copy_Atom<UniversalCopy<cutlass::AlignedArray<ElementKV, 16, 32>>, cutlass::AlignedArray<ElementKV, 16, 32>>;
+        using Copy_Atom_s2r_k = Copy_Atom<XE_1D_LDSM<ElementKV>, ElementKV>;
         using TVLayoutLoad_k = typename decltype(tiled_copy_k)::TiledLayout_TV;
         using Tiler_MN_load_k = typename decltype(tiled_copy_k)::Tiler_MN;
         auto s2r_copy_K = TiledCopy<Copy_Atom_s2r_k, TVLayoutLoad_k, Tiler_MN_load_k>{};
         auto thr_copy_s2r_k = s2r_copy_K.get_slice(thr_id);
 
         auto tiled_copy_v = make_block_2d_copy_B(mma_pv, make_tensor(make_gmem_ptr(static_cast<ElementKV*>(nullptr)), SmemLayoutVTransposed{}));
-        // FIXME: how to choose copy atom???
-        using Copy_Atom_s2r_v = Copy_Atom<UniversalCopy<cutlass::AlignedArray<ElementKV, 16, 32>>, cutlass::AlignedArray<ElementKV, 16, 32>>;
+        // using Copy_Atom_s2r_v = Copy_Atom<UniversalCopy<cutlass::AlignedArray<ElementKV, 16, 32>>, cutlass::AlignedArray<ElementKV, 16, 32>>;
+        // FIXME: V is transposed in SLM, cannot use vectorized copy atom???
+        // using Copy_Atom_s2r_v = Copy_Atom<UniversalCopy<ElementKV>, ElementKV>;
+        using Copy_Atom_s2r_v = Copy_Atom<XE_1D_LDSM<ElementKV>, ElementKV>;
         using TVLayoutLoad_v = typename decltype(tiled_copy_v)::TiledLayout_TV;
         using Tiler_MN_load_v = typename decltype(tiled_copy_v)::Tiler_MN;
         auto s2r_copy_V = TiledCopy<Copy_Atom_s2r_v, TVLayoutLoad_v, Tiler_MN_load_v>{};
@@ -198,7 +257,7 @@ public:
 
         // (((8,2),2),1,1,9)
         auto tQgQ = thr_copy_q.partition_S(gQ);
-        // (1,(2,32),1,8)
+        // ((1,(2,32)),1,8)
         auto tKsK = thr_copy_s2r_k.partition_S(K_slm);
 
         /* Create register fragments for MMA and copies */
@@ -209,14 +268,19 @@ public:
         // ((16,2),1,1)
         auto tQrQ = thr_copy_q.retile_D(tSrQ);
 
-        static_assert(is_same_v<decltype(tKsK.shape()), float>, "dtype mismatch");
+        // ((8,4),1,1,8)
+        auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+        // ((8,4),1,1,8)
+        auto tOgO = thr_copy_o.partition_D(gO);
+
+        // static_assert(is_same_v<decltype(tOgO.shape()), float>, "dtype mismatch");
 
         // ((2,8),1,4)
         auto tSrK = thr_mma_qk.partition_sg_fragment_B(sK(_,_,0));
         // ((1,64),1,1)
         auto tKrK = thr_copy_s2r_k.retile_D(tSrK);
 
-        // static_assert(is_same_v<decltype(tKrK.shape()), float>, "dtype mismatch");
+        // static_assert(is_same_v<decltype(tKsK.shape()), float>, "dtype mismatch");
 
         // FIXME: subgroup tensor or per-thread tensor???
         // (8,1,1)
@@ -285,7 +349,7 @@ public:
         // copy one tile of Q and K to call mma
         auto qk_gemm_one_tile = [&](int tile_idx) {
             copy(tiled_copy_Q, tQgQ(_,_,_,tile_idx), tQrQ);
-            copy(s2r_copy_K, tKsK(_,_,_,tile_idx), tKrK);
+            copy(s2r_copy_K, tKsK(_,_,tile_idx), tKrK(_,_,0));
             cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
         };
 
@@ -306,17 +370,17 @@ public:
 
         // storing block row-max and row-sum
         // (8,1,1)
-        using FragS = decltype(tSrS);
+        // using FragS = decltype(tSrS);
         // (1) - thr_id 0 ~ B_H-1 holds max of each row
-        using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+        // using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
 
         // (8,1,4)
-        using SingleFragA = decltype(thr_mma_pv.partition_sg_fragment_C(make_identity_tensor(select<0,1>(KernelConfig::TileShapePV{}))));
+        // using SingleFragA = decltype(thr_mma_pv.partition_sg_fragment_C(make_identity_tensor(select<0,1>(KernelConfig::TileShapePV{}))));
         // （8,1,4,8)
-        using FragA = expand_sg_fragment_t<SingleFragA, 1, KernelConfig::D_V / get<1>(KernelConfig::TileShapePV{})>;     // (atom val,q',v',VV)
+        // using FragA = expand_sg_fragment_t<SingleFragA, 1, KernelConfig::D_V / get<1>(KernelConfig::TileShapePV{})>;     // (atom val,q',v',VV)
         // storing updated global row-max and row-sum
         // (1) - thr_id 0 ~ B_H-1 holds max of each row
-        using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
+        // using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
         // static_assert(is_same_v<decltype(FragA{}.shape()), float>, "dtype mismatch");
 
         FragA tArA;
@@ -364,7 +428,7 @@ public:
         auto tArP = thr_mma_pv.partition_sg_fragment_A(proxyP);
         // ((2,8),4,1)
         auto tArV = thr_mma_pv.partition_sg_fragment_B(sV(_,_,0));
-        // (1,(2,8,4),9,1)
+        // ((1,(2,8,4)),9,1)
         auto tVsV = thr_copy_s2r_v.partition_S(V_slm);
         // ((1,64),1,1)
         auto tVrV = thr_copy_s2r_v.retile_D(tArV);
@@ -372,13 +436,134 @@ public:
         // static_assert(is_same_v<decltype(tVsV.shape()), float>, "dtype mismatch");
 
         auto pv_gemm_one_tile = [&](int v_tile_idx) {
-            copy(s2r_copy_V, tVsV(_,_,v_tile_idx,_), tVrV);
+            copy(s2r_copy_V, tVsV(_,v_tile_idx,_), tVrV(_,_,0));
             // FIXME: can remove?
             reorder(tSrS, tArP);
             cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,v_tile_idx));
         };
 
+        auto reduce_L = [&]() -> std::tuple<FragA, FragARow, bool> {
+            // refer to https://github.com/intel/sycl-tla/blob/main/applications/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp#L188
+            if constexpr (ReduceK{} == _1{}) {
+                return std::make_tuple(tArA, tA_sum, true);
+            } else {
+                /* Identify A tile ID and k block for this subgroup. */
+                auto thr_vak = group<1,3>(mma_pv.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
+                auto a_tile = get<1>(thr_vak);
+                auto k_blk = get<2>(thr_vak);
+
+                /* Set up SLM tensors and partition A tiles among participating subgroups */
+                auto shape_A     = append(append(SGTileShapeA{}, ReduceK{}), SGPerWG{}/ReduceK{});
+                auto shape_A_row = make_shape(get<0>(SGTileShapeO{}), shape(ReduceSGLayout{}), ReduceK{}, SGPerWG{}/ReduceK{});
+
+                /* Physical layouts, with subtile modes broken out */
+                auto sA_layout = group<2,4>(flat_divide(make_ordered_layout(shape_A, Step<_1,_0,_2,_3>{}), SGTileShapeO{}));
+                auto sA_row_stride = make_stride(_1{}, make_stride(get<0>(shape_A_row), _0{}),
+                                                AlignedSGTileA_Q{}, AlignedSGTileA_Q{} * ReduceK{});
+                auto sA_row_layout = make_layout(shape_A_row, sA_row_stride);
+
+                /* Coordinate layouts, with subtile modes broken out */
+                auto basis2 = make_basis_like(SGTileShapeO{});
+                auto sA_coords = make_layout(append(SGTileShapeO{}, shape(ReduceSGLayout{})),
+                                            append(basis2, product_each(zip(SGTileShapeO{}, basis2))));
+
+                auto sA     = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_data),     sA_layout);      // (q,v,rblk_dst,rblk_src,a_tile)
+                auto sA_max = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_max_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
+                auto sA_sum = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_sum_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
+
+                /* Write my contributions to SLM. */
+                copy_block_r2s(tA_max, sA_max(_,_,k_blk,a_tile));
+                barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+                copy_block_r2s(tA_sum, sA_sum(_,_,k_blk,a_tile));
+                copy_block_r2s(tArA, sA(_,_,_,k_blk,a_tile), sA_coords);
+
+                bool active = (k_blk      < size(ReduceSGLayout{}))
+                            || (ReduceK{} == size(ReduceSGLayout{}));    // help compiler out
+
+                /* Wait for maxima to be available, signal other data available */
+                barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+                barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+
+                ReduceFragA rA;
+                ReduceFragARow rA_sum, rA_max, rA_kmax[ReduceK{}];
+
+                if (active) {
+                    /* Read A_max back from SLM and reduce. */
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int kr = 0; kr < ReduceK{}; kr++) {
+                        copy_block_s2r(sA_max(_,k_blk,kr,a_tile), rA_kmax[kr]);
+                    }
+
+                    rA_max = rA_kmax[0];
+                    for (int kr = 1; kr < ReduceK{}; kr++)
+                        cute::transform(rA_max, rA_kmax[kr], rA_max, cute::max_fn{});
+
+                    /* Calculate scale factors for aligning per-block maxima. */
+                    for (int kr = 0; kr < ReduceK{}; kr++) {
+                        cute::transform(rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) {
+                            return sycl::native::exp2(kmax - gmax);
+                        });
+                    }
+                }
+
+                /* Wait for A/A_sum data to be available */
+                barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+
+                if (active) {
+                    /* Read A/A_sum back from SLM, align scaling to new maxima, and reduce. */
+                    clear(rA_sum);
+
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int kr = 0; kr < ReduceK{}; kr++) {
+                        ReduceFragARow rA_sum_read;
+                        copy_block_s2r(sA_sum(_,k_blk,kr,a_tile), rA_sum_read);
+
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int i = 0; i < rA_sum_read.size(); i++) {
+                            rA_sum(i) += rA_sum_read(i) * rA_kmax[kr](i);
+                        }
+                    }
+
+                    clear(rA);
+
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int kr = 0; kr < ReduceK{}; kr++) {
+                        ReduceFragA rA_read;
+                        copy_block_s2r(sA(_,_,k_blk,kr,a_tile), sA_coords(_,_,0), rA_read);
+
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int i = 0; i < rA_read.size(); i++) {
+                            rA(i) += rA_read(i) * broadcast<0>(rA_kmax[kr], rA, i);
+                        }
+                    }
+                }
+                return std::make_tuple(rA, rA_sum, active);
+            }
+        };
+
+        auto final_rescale_and_store_o = [&]() {
+            // reduce global row-sum
+            auto [tArA, tA_sum, active] = reduce_L();
+
+            if (!active) return;
+
+            // rescale output
+            CUTE_UNROLL
+            for (int i = 0; i < tA_sum.size(); ++i) {
+                tA_sum(i) =  ElementA(1) / tA_sum(i);
+            }
+
+            CUTE_UNROLL
+            for (int i = 0; i < tArA.size(); ++i) {
+                tArA(i) *= broadcast<0>(tA_sum, tArA, i);
+            }
+
+            reorder(tArA, tOrO);
+            copy(tiled_copy_O, tOrO, tOgO);
+        };
+
         int num_topk_blocks = ceil_div(real_topk_length, KernelConfig::B_TOPK);
+        // mainloop
         CUTE_NO_UNROLL
         for (int topk_idx = 0; topk_idx < num_topk_blocks; ++topk_idx) {
             load_token_indices_and_save_to_slm(topk_idx);
@@ -411,6 +596,9 @@ public:
             pv_gemm_one_tile(6);
             pv_gemm_one_tile(7);
         }
+
+        // epilogue
+        final_rescale_and_store_o();
     }
 };
 
